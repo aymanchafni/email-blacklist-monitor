@@ -15,6 +15,7 @@ from typing import List, Dict, Optional, Tuple
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import atexit
 
 
 # Configure logging
@@ -48,7 +49,7 @@ class EmailMonitorSystem:
             "monitor_email": os.getenv('MONITOR_EMAIL'),
             "alert_email": os.getenv('ALERT_EMAIL'),
             "blacklist_file": os.getenv('BLACKLIST_FILE'),
-            "check_interval": os.getenv('CHECK_INTERVAL'),
+            "check_interval": int(os.getenv('CHECK_INTERVAL')),
             "tesseract_path": os.getenv('TESSERACT_PATH')  # Update this path as needed
         }
         
@@ -57,27 +58,107 @@ class EmailMonitorSystem:
         self.blacklist_df = None
         self.processed_emails = set()
         self.last_check_time = datetime.now()
+        self.token_cache = None
+        self.cache_file = "token_cache.json"  # Cache file name
+        self.processed_emails_file = "processed_emails.json"  # File to store processed email IDs
         
-        # Initialize MSAL application
+        # Initialize MSAL application with persistent cache
         self.init_msal_app()
+        
+        # Load processed emails from file
+        self.load_processed_emails()
         
         # Load blacklist
         self.load_blacklist()
 
-        
-    
     def init_msal_app(self):
-        """Initialize MSAL application for authentication"""
+        """Initialize MSAL application for authentication with persistent token cache"""
+        # Create a persistent token cache
+        self.token_cache = msal.SerializableTokenCache()
+        
+        # Load existing cache if available
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'r') as cache_file:
+                    self.token_cache.deserialize(cache_file.read())
+                logger.info("Loaded existing token cache")
+            except Exception as e:
+                logger.warning(f"Failed to load token cache: {e}")
+        
+        # Set up automatic cache saving
+        atexit.register(self._save_token_cache)
+        
+        # Initialize MSAL app with cache
         self.app = msal.PublicClientApplication(
             self.config["client_id"],
-            authority=self.config["authority"]
+            authority=self.config["authority"],
+            token_cache=self.token_cache
         )
     
+    def _save_token_cache(self):
+        """Save token cache to file if it has changed"""
+        if self.token_cache and self.token_cache.has_state_changed:
+            try:
+                with open(self.cache_file, 'w') as cache_file:
+                    cache_file.write(self.token_cache.serialize())
+                logger.info("Token cache saved successfully")
+            except Exception as e:
+                logger.error(f"Failed to save token cache: {e}")
+    
+    def load_processed_emails(self):
+        """Load processed email IDs from file"""
+        try:
+            if os.path.exists(self.processed_emails_file):
+                with open(self.processed_emails_file, 'r') as f:
+                    processed_list = json.load(f)
+                    self.processed_emails = set(processed_list)
+                    logger.info(f"Loaded {len(self.processed_emails)} processed email IDs from cache")
+            else:
+                logger.info("No processed emails cache file found, starting fresh")
+        except Exception as e:
+            logger.error(f"Failed to load processed emails: {e}")
+            self.processed_emails = set()
+    
+    def save_processed_emails(self):
+        """Save processed email IDs to file"""
+        try:
+            with open(self.processed_emails_file, 'w') as f:
+                json.dump(list(self.processed_emails), f)
+            logger.debug(f"Saved {len(self.processed_emails)} processed email IDs to cache")
+        except Exception as e:
+            logger.error(f"Failed to save processed emails: {e}")
+    
+    def add_processed_email(self, email_id: str):
+        """Add an email ID to the processed set and save to file"""
+        self.processed_emails.add(email_id)
+        self.save_processed_emails()
+    
+    def clear_processed_emails(self):
+        """Clear the processed emails cache (useful for testing or resetting)"""
+        try:
+            if os.path.exists(self.processed_emails_file):
+                os.remove(self.processed_emails_file)
+                logger.info("Processed emails cache cleared")
+            
+            self.processed_emails = set()
+            logger.info("Processed emails set reset")
+        except Exception as e:
+            logger.error(f"Failed to clear processed emails cache: {e}")
+    
+    def cleanup_old_processed_emails(self, days_to_keep: int = 30):
+        """Clean up old processed email IDs to prevent the cache from growing too large"""
+        # Note: This is a simple implementation. In a production system, you might want to 
+        # store timestamps with email IDs to do proper cleanup based on age
+        if len(self.processed_emails) > 10000:  # Arbitrary threshold
+            logger.info(f"Processed emails cache is large ({len(self.processed_emails)} items), consider periodic cleanup")
+            # You could implement more sophisticated cleanup here if needed
+    
     def get_access_token(self) -> str:
-        """Get access token using device code flow"""
+        """Get access token using device code flow with persistent caching"""
         # Try to get token from cache first
         accounts = self.app.get_accounts()
         if accounts:
+            logger.info("Found cached account, attempting silent token acquisition...")
             result = self.app.acquire_token_silent(
                 self.config["scope"],
                 account=accounts[0]
@@ -85,7 +166,11 @@ class EmailMonitorSystem:
             if result and "access_token" in result:
                 self.access_token = result["access_token"]
                 logger.info("Successfully acquired token from cache")
+                # Save cache after successful silent acquisition
+                self._save_token_cache()
                 return self.access_token
+            else:
+                logger.info("Silent token acquisition failed, will try device flow")
         
         # If no cached token, use device code flow
         logger.info("No cached token found, initiating device code flow...")
@@ -111,12 +196,28 @@ class EmailMonitorSystem:
         if "access_token" in result:
             self.access_token = result["access_token"]
             logger.info("Successfully acquired access token via device flow")
+            # Save cache after successful device flow
+            self._save_token_cache()
             return self.access_token
         else:
             error_msg = result.get('error_description', result.get('error', 'Unknown error'))
             logger.error(f"Failed to acquire token: {error_msg}")
             logger.error(f"Full error response: {result}")
             raise Exception(f"Failed to acquire access token: {error_msg}")
+    
+    def clear_token_cache(self):
+        """Clear the token cache (useful for testing or if authentication issues occur)"""
+        try:
+            if os.path.exists(self.cache_file):
+                os.remove(self.cache_file)
+                logger.info("Token cache cleared")
+            
+            # Reinitialize the app with a fresh cache
+            self.init_msal_app()
+            self.access_token = None
+            logger.info("MSAL app reinitialized with fresh cache")
+        except Exception as e:
+            logger.error(f"Failed to clear token cache: {e}")
     
     def load_blacklist(self):
         """Load blacklist CSV file"""
@@ -142,46 +243,10 @@ class EmailMonitorSystem:
             logger.error(f"Error loading blacklist: {str(e)}")
             raise
     
-    def test_authentication(self):
-        """Test authentication and permissions"""
-        try:
-            if not self.access_token:
-                self.get_access_token()
-            
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'Content-Type': 'application/json'
-            }
-            
-            # Test basic Graph API access
-            test_url = "https://graph.microsoft.com/v1.0/me"
-            response = requests.get(test_url, headers=headers)
-            
-            if response.status_code == 200:
-                logger.info("Successfully authenticated with Graph API")
-                logger.info(f"Authenticated as: {response.json().get('displayName', 'Unknown')}")
-            else:
-                logger.error(f"Authentication test failed: {response.status_code} - {response.text}")
-            
-            # Test access to user's mailbox
-            mailbox_url = f"https://graph.microsoft.com/v1.0/me/messages"
-            params = {'$top': 1}
-            
-            response = requests.get(mailbox_url, headers=headers, params=params)
-            
-            if response.status_code == 200:
-                logger.info(f"Successfully accessed mailbox for authenticated user")
-                return True
-            else:
-                logger.error(f"Failed to access mailbox: {response.status_code} - {response.text}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Authentication test failed: {str(e)}")
-            return False
+    
     
     def get_new_emails(self) -> List[Dict]:
-        """Get new emails from the monitored account"""
+        """Get new emails from the inbox only, filtering out already processed ones"""
         if not self.access_token:
             self.get_access_token()
         
@@ -193,8 +258,8 @@ class EmailMonitorSystem:
         # Format datetime for OData filter
         filter_time = self.last_check_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
         
-        # Get emails from the authenticated user's mailbox
-        url = f"https://graph.microsoft.com/v1.0/me/messages"
+        # Get emails from the inbox folder specifically
+        url = f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
         params = {
             '$filter': f"receivedDateTime gt {filter_time}",
             '$expand': 'attachments',
@@ -205,13 +270,23 @@ class EmailMonitorSystem:
             response = requests.get(url, headers=headers, params=params)
             response.raise_for_status()
             
-            emails = response.json().get('value', [])
-            logger.info(f"Found {len(emails)} new emails")
+            all_emails = response.json().get('value', [])
             
-            return emails
+            # Filter out already processed emails
+            new_emails = []
+            for email in all_emails:
+                email_id = email.get('id')
+                if email_id not in self.processed_emails:
+                    new_emails.append(email)
+                else:
+                    logger.debug(f"Skipping already processed email: {email.get('subject', 'No Subject')}")
+            
+            logger.info(f"Found {len(all_emails)} total emails in inbox, {len(new_emails)} are new and unprocessed")
+            
+            return new_emails
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching emails: {str(e)}")
+            logger.error(f"Error fetching emails from inbox: {str(e)}")
             return []
     
     def download_attachment(self, email_id: str, attachment_id: str) -> Optional[bytes]:
@@ -412,11 +487,13 @@ class EmailMonitorSystem:
         
         logger.info(f"Processing email: {subject}")
         
-        # Skip if already processed
+        # Skip if already processed (double-check, though get_new_emails should filter these out)
         if email_id in self.processed_emails:
+            logger.debug(f"Email {email_id} already processed, skipping")
             return
         
-        self.processed_emails.add(email_id)
+        # Mark as processed immediately to avoid duplicate processing
+        self.add_processed_email(email_id)
         
         # Check if email has attachments
         attachments = email.get('attachments', [])
@@ -460,13 +537,17 @@ class EmailMonitorSystem:
         logger.info("Starting email monitoring system...")
         
         # Test authentication first
-        if not self.test_authentication():
-            logger.error("Authentication failed. Please check your credentials and permissions.")
-            return
+        
+        
+        # Log initial state
+        logger.info(f"Starting with {len(self.processed_emails)} previously processed emails")
+        
+        # Optional: Clean up old processed emails to prevent unlimited growth
+        self.cleanup_old_processed_emails()
         
         while True:
             try:
-                # Get new emails
+                # Get new emails from inbox only (already filtered to exclude processed ones)
                 new_emails = self.get_new_emails()
                 
                 # Process each new email

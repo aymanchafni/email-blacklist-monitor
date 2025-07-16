@@ -1,3 +1,7 @@
+
+token_cache.json
+processed_emails.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
