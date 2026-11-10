@@ -212,3 +212,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Project (secrets, personal data, runtime state)
+.env
+blacklist.csv
+monitor_state.json
+monitor_state.json.tmp
+token_cache.json
+processed_emails.json
+email_monitor.log
